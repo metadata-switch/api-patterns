@@ -1,3 +1,660 @@
+--3
+import boto3
+import json
+import sys
+from datetime import datetime, date
+import numpy as np
+import pandas as pd
+import psycopg2
+from google.cloud import bigquery
+from google.oauth2 import service_account
+from google.api_core import retry
+from awsglue.utils import getResolvedOptions
+
+
+# ---------------- Glue Args ----------------
+def load_args():
+    return getResolvedOptions(
+        sys.argv,
+        [
+            "job_name",
+            "region_name",
+            "secret_name",
+            "redshift_iam_role",
+            "s3_bucket",
+            "s3_prefix",
+            "chunk_size",
+            "redshift_schema",
+            "metadata_table",
+            "etl_log_table"
+        ]
+    )
+
+
+# ---------------- Read Metadata ----------------
+def read_metadata(cursor, schema, table):
+    cursor.execute(f"""
+        SELECT
+            view_name,
+            schema_name,
+            incremental_field,
+            is_full_load,
+            columns_required,
+            redshift_schema,
+            redshift_table
+        FROM {schema}.{table}
+        ORDER BY view_name
+    """)
+    cols = [c[0] for c in cursor.description]
+    return pd.DataFrame(cursor.fetchall(), columns=cols)
+
+
+# ---------------- Get Last Incremental Date ----------------
+def get_last_incremental_date(cursor, schema, table, target_table):
+    cursor.execute(f"""
+        SELECT MAX(last_updated_date)
+        FROM {schema}.{table}
+        WHERE table_name = %s
+          AND job_status = 'SUCCESS'
+    """, (target_table,))
+    row = cursor.fetchone()
+    return row[0] if row and row[0] else None
+
+
+# ---------------- Build BigQuery SQL ----------------
+def build_query(row, project_id, incremental_date):
+    query = f"""
+        SELECT {row['columns_required']}
+        FROM `{project_id}.{row['schema_name']}.{row['view_name']}`
+    """
+    if row["is_full_load"] == "N" and incremental_date:
+        query += f"""
+            WHERE {row['incremental_field']}
+            >= DATETIME('{incremental_date}')
+        """
+    return query.strip()
+
+
+# ---------------- Enrich Data ----------------
+def enrich_data(df, load_time):
+    df["dw_insert_dt"] = load_time
+    df.columns = df.columns.str.lower()
+    df = df.replace([np.nan, np.inf, -np.inf], None)
+    return df
+
+
+# ---------------- JSON Serializer ----------------
+def json_serializer(v):
+    if v is None:
+        return None
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d")
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return v
+
+
+# ---------------- Write To S3 ----------------
+def write_to_s3(df, bucket, key, s3):
+    lines = df.apply(
+        lambda row: json.dumps(
+            row.to_dict(),
+            default=json_serializer,
+            allow_nan=False
+        ),
+        axis=1
+    )
+    payload = "\n".join(lines)
+
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=payload.encode("utf-8"),
+        ContentType="application/json"
+    )
+
+
+# ---------------- S3 File Handling ----------------
+def delete_s3_file(s3, bucket, key):
+    s3.delete_object(Bucket=bucket, Key=key)
+
+
+def move_s3_file_to_failed(s3, bucket, key, prefix):
+    failed_key = f"{prefix.rstrip('/')}/failed/{key.split('/')[-1]}"
+    s3.copy_object(
+        Bucket=bucket,
+        CopySource={"Bucket": bucket, "Key": key},
+        Key=failed_key
+    )
+    s3.delete_object(Bucket=bucket, Key=key)
+
+
+# ---------------- COPY To Redshift ----------------
+def load_to_redshift(cursor, schema, table, s3_path, iam_role):
+    cursor.execute(f"""
+        COPY {schema}.{table}
+        FROM '{s3_path}'
+        IAM_ROLE '{iam_role}'
+        FORMAT AS JSON 'auto'
+        TIMEFORMAT 'auto'
+        TRUNCATECOLUMNS
+        BLANKSASNULL
+        EMPTYASNULL;
+    """)
+
+
+# ---------------- Insert Log ----------------
+def insert_run_log(
+    cursor,
+    schema,
+    job_name,
+    table_name,
+    load_type,
+    start_time,
+    end_time,
+    error_message,
+    record_count,
+    job_status,
+    last_updated_date
+):
+    cursor.execute(f"""
+        INSERT INTO {schema}.etl_run_log (
+            job_name,
+            table_name,
+            load_type,
+            job_start_time,
+            job_end_time,
+            error_message,
+            record_count,
+            job_status,
+            last_updated_date
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        job_name,
+        table_name,
+        load_type,
+        start_time,
+        end_time,
+        error_message,
+        record_count,
+        job_status,
+        last_updated_date
+    ))
+
+
+# ---------------- MAIN ----------------
+if __name__ == "__main__":
+
+    args = load_args()
+
+    s3 = boto3.client("s3")
+    secrets = boto3.client("secretsmanager", region_name=args["region_name"])
+
+    secret = json.loads(
+        secrets.get_secret_value(SecretId=args["secret_name"])["SecretString"]
+    )
+
+    # BigQuery
+    gcp_info = {k.replace("gcp_", ""): v for k, v in secret.items() if k.startswith("gcp_")}
+    gcp_info["private_key"] = gcp_info["private_key"].replace("\\n", "\n")
+    credentials = service_account.Credentials.from_service_account_info(gcp_info)
+    bq_client = bigquery.Client(credentials=credentials, project=gcp_info["project_id"])
+    bq_retry = retry.Retry(deadline=300)
+
+    # Redshift
+    redshift_conn = psycopg2.connect(
+        host=secret["redshift_hostname"],
+        dbname=secret["redshift_database_name"],
+        user=secret["redshift_username"],
+        password=secret["redshift_password"],
+        port=5439
+    )
+    redshift_cursor = redshift_conn.cursor()
+
+    metadata_df = read_metadata(
+        redshift_cursor,
+        args["redshift_schema"],
+        args["metadata_table"]
+    )
+
+    for _, row in metadata_df.iterrows():
+
+        job_start = datetime.now()
+        job_status = "SUCCESS"
+        error_message = None
+        record_count = 0
+
+        max_incremental_value = None
+        max_dw_insert_dt = None
+
+        table_load_time = datetime.utcnow()
+
+        try:
+            incremental_date = None
+
+            if row["is_full_load"] == "N":
+                incremental_date = get_last_incremental_date(
+                    redshift_cursor,
+                    args["redshift_schema"],
+                    args["etl_log_table"],
+                    row["redshift_table"]
+                )
+
+            query = build_query(row, gcp_info["project_id"], incremental_date)
+
+            job = bq_client.query(query, retry=bq_retry)
+            result = job.result(page_size=int(args["chunk_size"]))
+
+            for chunk in result.to_dataframe_iterable():
+
+                chunk = enrich_data(chunk, table_load_time)
+
+                # Track incremental max
+                if row["is_full_load"] == "N" and row["incremental_field"] and \
+                        row["incremental_field"].lower() in chunk.columns:
+
+                    chunk_max = chunk[row["incremental_field"].lower()].max()
+
+                    if max_incremental_value is None or chunk_max > max_incremental_value:
+                        max_incremental_value = chunk_max
+
+                # Track dw_insert_dt max
+                if "dw_insert_dt" in chunk.columns:
+                    dw_max = chunk["dw_insert_dt"].max()
+                    if max_dw_insert_dt is None or dw_max > max_dw_insert_dt:
+                        max_dw_insert_dt = dw_max
+
+                ts = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+                s3_key = f"{args['s3_prefix'].rstrip('/')}/{row['view_name']}_{ts}.json"
+
+                write_to_s3(chunk, args["s3_bucket"], s3_key, s3)
+
+                try:
+                    load_to_redshift(
+                        redshift_cursor,
+                        row["redshift_schema"],
+                        row["redshift_table"],
+                        f"s3://{args['s3_bucket']}/{s3_key}",
+                        args["redshift_iam_role"]
+                    )
+
+                    redshift_conn.commit()
+                    delete_s3_file(s3, args["s3_bucket"], s3_key)
+                    record_count += len(chunk)
+
+                except Exception as copy_err:
+                    job_status = "FAILED"
+                    error_message = str(copy_err)
+                    redshift_conn.rollback()
+                    move_s3_file_to_failed(
+                        s3,
+                        args["s3_bucket"],
+                        s3_key,
+                        args["s3_prefix"]
+                    )
+                    break
+
+        except Exception as e:
+            job_status = "FAILED"
+            error_message = str(e)
+
+        # Final last_updated_date logic
+        if row["is_full_load"] == "N":
+            final_last_updated_date = max_incremental_value
+        else:
+            final_last_updated_date = max_dw_insert_dt
+
+        insert_run_log(
+            redshift_cursor,
+            args["redshift_schema"],
+            args["job_name"],
+            row["redshift_table"],
+            "FULL" if row["is_full_load"] == "Y" else "INCREMENTAL",
+            job_start,
+            datetime.now(),
+            error_message,
+            record_count,
+            job_status,
+            final_last_updated_date
+        )
+
+        redshift_conn.commit()
+
+    redshift_cursor.close()
+    redshift_conn.close()
+
+    print("BigQuery S3 to Redshift ETL completed successfully")
+
+
+--2
+import sys
+import json
+import boto3
+import requests
+from requests.auth import HTTPBasicAuth
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from datetime import datetime
+import psycopg2
+from awsglue.utils import getResolvedOptions
+import io
+
+# ---------------- UTILITY FUNCTIONS ----------------
+
+def get_job_args():
+    return getResolvedOptions(
+        sys.argv,
+        [
+            "JOB_NAME",
+            "load_type",
+            "api_header_name",
+            "s3_bucket",
+            "s3_key_prefix",
+            "iam_role",
+            "stage_table",
+            "log_table",
+            "secret_name"
+        ]
+    )
+
+def get_secrets(secret_name):
+    secrets_client = boto3.client("secretsmanager")
+    secret_value = secrets_client.get_secret_value(SecretId=secret_name)
+    return json.loads(secret_value["SecretString"])
+
+def get_redshift_connection(secret_dict):
+    conn = psycopg2.connect(
+        host=secret_dict["redshift_hostname"],
+        port=5439,
+        dbname=secret_dict["redshift_database_name"],
+        user=secret_dict["redshift_username"],
+        password=secret_dict["redshift_password"]
+    )
+    conn.autocommit = True
+    return conn
+
+def create_api_session(API_HEADER_NAME, key_value, username=None, password=None):
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.headers.update({
+        API_HEADER_NAME: key_value,
+        "Accept": "application/json"
+    })
+    if username and password:
+        session.auth = HTTPBasicAuth(username, password)
+    return session
+
+def fetch_ukg_pro_locations(session, url):
+    try:
+        response = session.get(url, timeout=(5, 30))
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Pro Locations API failed → {e}")
+
+    payload = response.json()
+    filtered_records = payload.get("data", payload) if isinstance(payload, dict) else payload
+
+    print(f"Fetched {len(filtered_records)} Pro Locations records")
+    return filtered_records
+
+
+def transform_records(filtered_records,job_run_ts):
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    transformed_records = []
+
+    # Mapping dictionary for all fields
+    API_TO_REDSHIFT = {
+    "locationCode": "location_code",
+    "description": "description",
+    "isActive": "is_active",
+    "addressLine1": "address_line1",
+    "addressLine2": "address_line2",
+    "city": "city",
+    "state": "state",
+    "zipOrPostalCode": "ziporpostalcode",
+    "countryCode": "country_code",
+    "locationGLSegment": "location_gl_segment"
+    }
+
+    for record in filtered_records:
+        # Base transformation using the mapping
+        transformed = {rs_field: record.get(api_field) for api_field, rs_field in API_TO_REDSHIFT.items()}
+
+        # Add last_updated_date
+        transformed["last_updated_date"] = job_run_ts
+        transformed_records.append(transformed)
+
+    return transformed_records
+
+
+def write_to_s3(filtered_records, S3_BUCKET, S3_KEY_PREFIX):
+    json_buffer = io.StringIO()
+    for record in filtered_records:
+        json_buffer.write(json.dumps(record, ensure_ascii=False) + "\n")
+    json_buffer.seek(0)
+    s3_key = f"{S3_KEY_PREFIX}/pro_locations_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    s3_client = boto3.client("s3")
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=s3_key,
+        Body=json_buffer.getvalue(),
+        ContentType="application/json"
+    )
+    print(f"NDJSON uploaded to s3://{S3_BUCKET}/{s3_key}")
+    return s3_key
+
+# Strict COPY
+def copy_to_redshift(cur, STAGE_TABLE, S3_BUCKET, s3_key, IAM_ROLE, rs_db):
+    copy_sql = f"""
+        COPY {rs_db}.staging.{STAGE_TABLE}
+        FROM 's3://{S3_BUCKET}/{s3_key}'
+        IAM_ROLE '{IAM_ROLE}'
+        FORMAT AS JSON 'auto'
+        TIMEFORMAT 'auto'
+        MAXERROR 0;
+    """
+    cur.execute(copy_sql)
+
+
+# Get record count
+def get_record_count(cur, STAGE_TABLE, rs_db, job_run_ts):
+    cur.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM {rs_db}.staging.{STAGE_TABLE}
+        WHERE last_updated_date = %s;
+        """,
+        (job_run_ts,)
+    )
+    return cur.fetchone()[0]
+
+
+# Move file to failed folder
+def move_file_to_failed(S3_BUCKET, s3_key):
+    s3 = boto3.client("s3")
+
+    prefix, filename = s3_key.rsplit("/", 1)
+    failed_key = f"{prefix}/failed/{filename}"
+
+    s3.copy_object(
+        Bucket=S3_BUCKET,
+        CopySource={"Bucket": S3_BUCKET, "Key": s3_key},
+        Key=failed_key
+    )
+
+    s3.delete_object(Bucket=S3_BUCKET, Key=s3_key)
+
+
+# Delete file after success
+def delete_s3_file(S3_BUCKET, s3_key):
+    boto3.client("s3").delete_object(
+        Bucket=S3_BUCKET,
+        Key=s3_key
+    )
+
+
+# Delete old records
+def delete_old_records(cur, STAGE_TABLE, rs_db, job_run_ts):
+    delete_sql = f"""
+        DELETE FROM {rs_db}.staging.{STAGE_TABLE}
+        WHERE last_updated_date < %s;
+    """
+    cur.execute(delete_sql, (job_run_ts,))
+
+
+# Insert audit log
+def insert_audit_log(cur, JOB_NAME, STAGE_TABLE, LOAD_TYPE,
+                     job_start_time, job_end_time,
+                     job_status, error_message,
+                     record_count, rs_db, job_run_ts):
+
+    insert_sql = f"""
+        INSERT INTO {rs_db}.staging.etl_run_log
+        (
+            job_name,
+            table_name,
+            load_type,
+            job_start_time,
+            job_end_time,
+            error_message,
+            record_count,
+            last_updated_date,
+            job_status
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);
+    """
+
+    cur.execute(insert_sql, (
+        JOB_NAME,
+        STAGE_TABLE,
+        LOAD_TYPE,
+        job_start_time,
+        job_end_time,
+        error_message,
+        record_count,
+        job_run_ts,
+        job_status
+    ))
+
+# ---------------- MAIN FUNCTION ----------------
+def main():
+    job_start_time = datetime.utcnow()
+    job_run_ts = job_start_time.strftime("%Y-%m-%d %H:%M:%S")
+    job_status = "SUCCESS"
+    s3_key = None
+    error_message = None
+    record_count = 0
+
+    args = get_job_args()
+
+    # Config / Secret
+    SECRET = args["secret_name"]
+    secret_dict = get_secrets(SECRET)
+    rs_db = secret_dict["redshift_database_name"]
+
+    # Redshift connection
+    conn = get_redshift_connection(secret_dict)
+    cur = conn.cursor()
+
+    # API session
+    session = create_api_session(
+        API_HEADER_NAME=args["api_header_name"],
+        key_value=secret_dict["ukg_hcm_employmentdetails_api_key_value"],
+        username=secret_dict.get("ukg_hcm_employmentdetails_username"),
+        password=secret_dict.get("ukg_hcm_employmentdetails_password")
+    )
+
+    try:
+        # Fetch API data
+        filtered_records = fetch_ukg_pro_locations(
+            session=session,
+            url=secret_dict["ukg_pro_location_url"]
+        )
+
+        # Transform
+        transformed_records = transform_records(filtered_records,job_run_ts)
+
+        # S3 upload
+        s3_key = write_to_s3(transformed_records, args["s3_bucket"], args["s3_key_prefix"])
+
+        try:
+            copy_to_redshift(
+                cur,
+                args["stage_table"],
+                args["s3_bucket"],
+                s3_key,
+                args["iam_role"],
+                rs_db
+            )
+
+            record_count = get_record_count(
+                cur,
+                args["stage_table"],
+                rs_db,
+                job_run_ts
+            )
+
+            delete_s3_file(args["s3_bucket"], s3_key)
+
+        except Exception as copy_error:
+            job_status = "FAILED"
+            error_message = str(copy_error)
+            conn.rollback()
+
+            if s3_key:
+                move_file_to_failed(args["s3_bucket"], s3_key)
+
+            raise
+
+    except Exception as e:
+        job_status = "FAILED"
+        error_message = str(e)
+
+    finally:
+        job_end_time = datetime.utcnow()
+
+        insert_audit_log(
+            cur,
+            args["JOB_NAME"],
+            args["stage_table"],
+            args["load_type"],
+            job_start_time,
+            job_end_time,
+            job_status,
+            error_message,
+            record_count,
+            rs_db,
+            job_run_ts
+        )
+
+        conn.commit()
+
+        if job_status == "SUCCESS":
+            delete_old_records(
+                cur,
+                args["stage_table"],
+                rs_db,
+                job_run_ts
+            )
+            conn.commit()
+
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
+
+--1
+
+
 import sys
 import json
 import boto3
